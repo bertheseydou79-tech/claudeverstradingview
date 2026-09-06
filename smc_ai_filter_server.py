@@ -26,11 +26,15 @@ log = logging.getLogger("smc-filter")
 # ----------------------------------------------------------------------------
 # 1) CONFIG (variables d'environnement — voir .env.example)
 # ----------------------------------------------------------------------------
-WEBHOOK_SECRET     = os.environ["WEBHOOK_SECRET"]
-ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
-ANTHROPIC_MODEL    = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
+def _clean(v: str) -> str:
+    # Supprime espaces, tabulations et sauts de ligne parasites (copier-coller)
+    return (v or "").strip().strip('"').strip("'").strip()
+
+WEBHOOK_SECRET     = _clean(os.environ["WEBHOOK_SECRET"])
+ANTHROPIC_API_KEY  = _clean(os.environ["ANTHROPIC_API_KEY"])
+ANTHROPIC_MODEL    = _clean(os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5"))
+TELEGRAM_BOT_TOKEN = _clean(os.environ["TELEGRAM_BOT_TOKEN"])
+TELEGRAM_CHAT_ID   = _clean(os.environ["TELEGRAM_CHAT_ID"])
 
 MIN_SCORE   = float(os.environ.get("MIN_SCORE", "70"))
 MIN_TP1_R   = float(os.environ.get("MIN_TP1_R", "1.5"))
