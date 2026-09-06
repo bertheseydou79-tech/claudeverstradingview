@@ -29,6 +29,8 @@ log = logging.getLogger("smc-filter")
 def _clean(v: str) -> str:
     # Supprime espaces, tabulations et sauts de ligne parasites (copier-coller)
     return (v or "").strip().strip('"').strip("'").strip()
+def _clean(v):
+    return (v or "").strip().strip('"').strip("'").strip()
 
 WEBHOOK_SECRET     = _clean(os.environ["WEBHOOK_SECRET"])
 ANTHROPIC_API_KEY  = _clean(os.environ["ANTHROPIC_API_KEY"])
