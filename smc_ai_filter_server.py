@@ -1,11 +1,10 @@
-```python
 """
 TradingView Webhook Relay
 =========================
 TradingView -> Render -> Telegram
 
 Le serveur NE PREND AUCUNE décision de trading.
-L'indicateur TradingView est responsable de tous les filtres et décisions.
+TradingView est responsable de tous les filtres et décisions.
 
 Le serveur :
 1. reçoit le JSON TradingView
@@ -22,29 +21,31 @@ import logging
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tradingview-relay")
 
 
-# ----------------------------------------------------------------------------
-# 1) CONFIGURATION — variables d'environnement Render
-# ----------------------------------------------------------------------------
-
-def _clean(v: str) -> str:
-    return (v or "").strip().strip('"').strip("'").strip()
+def clean(value):
+    if value is None:
+        return ""
+    return str(value).strip().strip('"').strip("'")
 
 
-WEBHOOK_SECRET = _clean(os.environ["WEBHOOK_SECRET"])
-TELEGRAM_BOT_TOKEN = _clean(os.environ["TELEGRAM_BOT_TOKEN"])
-TELEGRAM_CHAT_ID = _clean(os.environ["TELEGRAM_CHAT_ID"])
+# ============================================================
+# VARIABLES D'ENVIRONNEMENT
+# ============================================================
+
+WEBHOOK_SECRET = clean(os.environ.get("WEBHOOK_SECRET"))
+TELEGRAM_BOT_TOKEN = clean(os.environ.get("TELEGRAM_BOT_TOKEN"))
+TELEGRAM_CHAT_ID = clean(os.environ.get("TELEGRAM_CHAT_ID"))
 
 
-# ----------------------------------------------------------------------------
-# 2) UTILITAIRES
-# ----------------------------------------------------------------------------
+# ============================================================
+# OUTILS
+# ============================================================
 
-def get_value(payload: dict, *names):
-    """Retourne la première valeur disponible."""
+def get_value(payload, *names):
     for name in names:
         if name in payload and payload[name] not in ("", None):
             return payload[name]
@@ -52,7 +53,6 @@ def get_value(payload: dict, *names):
 
 
 def format_number(value):
-    """Formate proprement les nombres sans modifier leur valeur."""
     if value is None:
         return "-"
 
@@ -69,7 +69,6 @@ def format_number(value):
 
 
 def normalize_direction(value):
-    """Convertit LONG/SHORT en BUY/SELL pour Telegram."""
     if value is None:
         return "SIGNAL"
 
@@ -84,12 +83,11 @@ def normalize_direction(value):
     return direction
 
 
-# ----------------------------------------------------------------------------
-# 3) CONSTRUCTION DU MESSAGE TELEGRAM
-# ----------------------------------------------------------------------------
+# ============================================================
+# MESSAGE TELEGRAM
+# ============================================================
 
-def build_telegram_message(payload: dict) -> str:
-
+def build_telegram_message(payload):
     direction_raw = get_value(
         payload,
         "dir",
@@ -108,14 +106,30 @@ def build_telegram_message(payload: dict) -> str:
     ) or "?"
 
     score = get_value(payload, "score")
-    entry = get_value(payload, "entry", "pe", "price")
-    sl = get_value(payload, "sl", "stop")
+
+    entry = get_value(
+        payload,
+        "entry",
+        "pe",
+        "price"
+    )
+
+    sl = get_value(
+        payload,
+        "sl",
+        "stop"
+    )
+
     tp1 = get_value(payload, "tp1")
     tp2 = get_value(payload, "tp2")
     tp3 = get_value(payload, "tp3")
-    risk_pct = get_value(payload, "risk_pct", "riskPct")
 
-    # Icônes uniquement pour l'affichage.
+    risk_pct = get_value(
+        payload,
+        "risk_pct",
+        "riskPct"
+    )
+
     if direction == "BUY":
         icon = "🟢"
     elif direction == "SELL":
@@ -140,32 +154,43 @@ def build_telegram_message(payload: dict) -> str:
     return message
 
 
-# ----------------------------------------------------------------------------
-# 4) ENVOI TELEGRAM
-# ----------------------------------------------------------------------------
+# ============================================================
+# TELEGRAM
+# ============================================================
 
-async def send_telegram(text: str):
+async def send_telegram(text):
+    if not TELEGRAM_BOT_TOKEN:
+        log.error("TELEGRAM_BOT_TOKEN manquant")
+        raise HTTPException(
+            status_code=500,
+            detail="TELEGRAM_BOT_TOKEN manquant"
+        )
+
+    if not TELEGRAM_CHAT_ID:
+        log.error("TELEGRAM_CHAT_ID manquant")
+        raise HTTPException(
+            status_code=500,
+            detail="TELEGRAM_CHAT_ID manquant"
+        )
 
     url = (
         f"https://api.telegram.org/"
         f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     )
 
-    payload = {
+    telegram_payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
-        "disable_web_page_preview": True,
+        "disable_web_page_preview": True
     }
 
     async with httpx.AsyncClient(timeout=15) as client:
-
         response = await client.post(
             url,
-            json=payload
+            json=telegram_payload
         )
 
         if response.status_code != 200:
-
             log.error(
                 "Erreur Telegram %s : %s",
                 response.status_code,
@@ -178,90 +203,77 @@ async def send_telegram(text: str):
             )
 
 
-# ----------------------------------------------------------------------------
-# 5) APPLICATION FASTAPI
-# ----------------------------------------------------------------------------
+# ============================================================
+# APPLICATION FASTAPI
+# ============================================================
 
 app = FastAPI(
     title="TradingView Telegram Relay"
 )
 
 
-# ----------------------------------------------------------------------------
-# 6) HEALTH CHECK
-# ----------------------------------------------------------------------------
+# ============================================================
+# HEALTH CHECK
+# ============================================================
 
 @app.get("/")
 async def health():
-
     return {
         "status": "ok",
         "mode": "relay_only"
     }
 
 
-# ----------------------------------------------------------------------------
-# 7) WEBHOOK TRADINGVIEW
-# ----------------------------------------------------------------------------
+# ============================================================
+# WEBHOOK TRADINGVIEW
+# ============================================================
 
 @app.post("/webhook")
 async def webhook(request: Request):
 
-    # Lire le corps de la requête
     raw = await request.body()
 
-    # Décoder le JSON
     try:
-
         payload = json.loads(raw)
 
     except json.JSONDecodeError:
-
         raise HTTPException(
             status_code=400,
             detail="JSON invalide"
         )
 
     if not isinstance(payload, dict):
-
         raise HTTPException(
             status_code=400,
             detail="Le JSON doit être un objet"
         )
 
-    # ------------------------------------------------------------------------
-    # Vérification du secret
-    # ------------------------------------------------------------------------
-
-    secret = str(
+    received_secret = str(
         payload.pop("secret", "")
     )
 
+    if not WEBHOOK_SECRET:
+        log.error("WEBHOOK_SECRET manquant")
+
+        raise HTTPException(
+            status_code=500,
+            detail="WEBHOOK_SECRET manquant"
+        )
+
     if not hmac.compare_digest(
-        secret,
+        received_secret,
         WEBHOOK_SECRET
     ):
+        log.warning("Secret webhook invalide")
 
         raise HTTPException(
             status_code=401,
             detail="Secret invalide"
         )
 
-    # ------------------------------------------------------------------------
-    # Construire le message
-    # ------------------------------------------------------------------------
-
     message = build_telegram_message(payload)
 
-    # ------------------------------------------------------------------------
-    # Envoyer Telegram
-    # ------------------------------------------------------------------------
-
     await send_telegram(message)
-
-    # ------------------------------------------------------------------------
-    # Log
-    # ------------------------------------------------------------------------
 
     log.info(
         "Signal envoyé : %s %s",
@@ -273,4 +285,3 @@ async def webhook(request: Request):
         "ok": True,
         "sent": True
     }
-```
