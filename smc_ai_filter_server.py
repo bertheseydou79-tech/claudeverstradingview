@@ -3,14 +3,8 @@ TradingView Webhook Relay
 =========================
 TradingView -> Render -> Telegram
 
-Le serveur NE PREND AUCUNE décision de trading.
-TradingView est responsable de tous les filtres et décisions.
-
-Le serveur :
-1. reçoit le JSON TradingView
-2. vérifie le secret
-3. formate le signal
-4. envoie le message à Telegram
+Le serveur ne prend aucune décision de trading.
+TradingView est responsable des filtres et décisions.
 """
 
 import os
@@ -22,28 +16,23 @@ import httpx
 from fastapi import FastAPI, Request, HTTPException
 
 
+# ============================================================
+# LOGGING
+# ============================================================
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tradingview-relay")
 
+
+# ============================================================
+# OUTILS
+# ============================================================
 
 def clean(value):
     if value is None:
         return ""
     return str(value).strip().strip('"').strip("'")
 
-
-# ============================================================
-# VARIABLES D'ENVIRONNEMENT
-# ============================================================
-
-WEBHOOK_SECRET = clean(os.environ.get("WEBHOOK_SECRET"))
-TELEGRAM_BOT_TOKEN = clean(os.environ.get("TELEGRAM_BOT_TOKEN"))
-TELEGRAM_CHAT_ID = clean(os.environ.get("TELEGRAM_CHAT_ID"))
-
-
-# ============================================================
-# OUTILS
-# ============================================================
 
 def get_value(payload, *names):
     for name in names:
@@ -84,10 +73,28 @@ def normalize_direction(value):
 
 
 # ============================================================
+# VARIABLES D'ENVIRONNEMENT
+# ============================================================
+
+WEBHOOK_SECRET = clean(
+    os.environ.get("WEBHOOK_SECRET")
+)
+
+TELEGRAM_BOT_TOKEN = clean(
+    os.environ.get("TELEGRAM_BOT_TOKEN")
+)
+
+TELEGRAM_CHAT_ID = clean(
+    os.environ.get("TELEGRAM_CHAT_ID")
+)
+
+
+# ============================================================
 # MESSAGE TELEGRAM
 # ============================================================
 
 def build_telegram_message(payload):
+
     direction_raw = get_value(
         payload,
         "dir",
@@ -105,7 +112,10 @@ def build_telegram_message(payload):
         "ticker"
     ) or "?"
 
-    score = get_value(payload, "score")
+    score = get_value(
+        payload,
+        "score"
+    )
 
     entry = get_value(
         payload,
@@ -120,9 +130,20 @@ def build_telegram_message(payload):
         "stop"
     )
 
-    tp1 = get_value(payload, "tp1")
-    tp2 = get_value(payload, "tp2")
-    tp3 = get_value(payload, "tp3")
+    tp1 = get_value(
+        payload,
+        "tp1"
+    )
+
+    tp2 = get_value(
+        payload,
+        "tp2"
+    )
+
+    tp3 = get_value(
+        payload,
+        "tp3"
+    )
 
     risk_pct = get_value(
         payload,
@@ -159,8 +180,10 @@ def build_telegram_message(payload):
 # ============================================================
 
 async def send_telegram(text):
+
     if not TELEGRAM_BOT_TOKEN:
         log.error("TELEGRAM_BOT_TOKEN manquant")
+
         raise HTTPException(
             status_code=500,
             detail="TELEGRAM_BOT_TOKEN manquant"
@@ -168,13 +191,14 @@ async def send_telegram(text):
 
     if not TELEGRAM_CHAT_ID:
         log.error("TELEGRAM_CHAT_ID manquant")
+
         raise HTTPException(
             status_code=500,
             detail="TELEGRAM_CHAT_ID manquant"
         )
 
     url = (
-        f"https://api.telegram.org/"
+        "https://api.telegram.org/"
         f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     )
 
@@ -184,23 +208,58 @@ async def send_telegram(text):
         "disable_web_page_preview": True
     }
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        response = await client.post(
-            url,
-            json=telegram_payload
+    try:
+
+        async with httpx.AsyncClient(
+            timeout=15
+        ) as client:
+
+            response = await client.post(
+                url,
+                json=telegram_payload
+            )
+
+        log.info(
+            "Telegram HTTP %s",
+            response.status_code
         )
 
-       if response.status_code != 200:
-    log.error(
-        "Erreur Telegram %s : %s",
-        response.status_code,
-        response.text
-    )
+        log.info(
+            "Telegram réponse: %s",
+            response.text
+        )
 
-    raise HTTPException(
-        status_code=502,
-        detail=response.text
-    )
+        if response.status_code != 200:
+
+            raise HTTPException(
+                status_code=502,
+                detail=response.text
+            )
+
+        result = response.json()
+
+        if not result.get("ok", False):
+
+            raise HTTPException(
+                status_code=502,
+                detail=response.text
+            )
+
+        return result
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+
+        log.exception(
+            "Erreur connexion Telegram"
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail=f"Erreur connexion Telegram: {str(e)}"
+        )
 
 
 # ============================================================
@@ -218,9 +277,35 @@ app = FastAPI(
 
 @app.get("/")
 async def health():
+
     return {
         "status": "ok",
         "mode": "relay_only"
+    }
+
+
+# ============================================================
+# TEST TELEGRAM
+# ============================================================
+
+@app.get("/test-telegram")
+async def test_telegram():
+
+    message = (
+        "🟢 TEST TELEGRAM\n"
+        "\n"
+        "Le relais Render fonctionne.\n"
+        "\n"
+        "Service: claudeverstradingview\n"
+        "Status: OK"
+    )
+
+    result = await send_telegram(message)
+
+    return {
+        "ok": True,
+        "telegram_test": True,
+        "telegram_response": result
     }
 
 
@@ -234,15 +319,18 @@ async def webhook(request: Request):
     raw = await request.body()
 
     try:
+
         payload = json.loads(raw)
 
     except json.JSONDecodeError:
+
         raise HTTPException(
             status_code=400,
             detail="JSON invalide"
         )
 
     if not isinstance(payload, dict):
+
         raise HTTPException(
             status_code=400,
             detail="Le JSON doit être un objet"
@@ -253,7 +341,10 @@ async def webhook(request: Request):
     )
 
     if not WEBHOOK_SECRET:
-        log.error("WEBHOOK_SECRET manquant")
+
+        log.error(
+            "WEBHOOK_SECRET manquant"
+        )
 
         raise HTTPException(
             status_code=500,
@@ -264,16 +355,23 @@ async def webhook(request: Request):
         received_secret,
         WEBHOOK_SECRET
     ):
-        log.warning("Secret webhook invalide")
+
+        log.warning(
+            "Secret webhook invalide"
+        )
 
         raise HTTPException(
             status_code=401,
             detail="Secret invalide"
         )
 
-    message = build_telegram_message(payload)
+    message = build_telegram_message(
+        payload
+    )
 
-    await send_telegram(message)
+    result = await send_telegram(
+        message
+    )
 
     log.info(
         "Signal envoyé : %s %s",
@@ -283,27 +381,6 @@ async def webhook(request: Request):
 
     return {
         "ok": True,
-        "sent": True
-    }
-
-
-# ============================================================
-# TEST TELEGRAM - TEMPORAIRE
-# ============================================================
-
-@app.get("/test-telegram")
-async def test_telegram():
-
-    message = """🟢 TEST TELEGRAM
-
-Le relais Render fonctionne.
-
-Service: claudeverstradingview
-Status: OK"""
-
-    await send_telegram(message)
-
-    return {
-        "ok": True,
-        "telegram_test": True
+        "sent": True,
+        "telegram_response": result
     }
