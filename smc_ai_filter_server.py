@@ -285,8 +285,15 @@ async def webhook(request: Request):
         "ok": True,
         "sent": True
     }
-    @app.get("/test-telegram")
+
+
+# ============================================================
+# TEST TELEGRAM - TEMPORAIRE
+# ============================================================
+
+@app.get("/test-telegram")
 async def test_telegram():
+
     message = """🟢 TEST TELEGRAM
 
 Le relais Render fonctionne.
@@ -294,22 +301,9 @@ Le relais Render fonctionne.
 Service: claudeverstradingview
 Status: OK"""
 
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message
-                }
-            )
+    await send_telegram(message)
 
-        return {
-            "telegram_status": response.status_code,
-            "telegram_response": response.json()
-        }
-
-    except Exception as e:
-        return {
-            "error": str(e)
-        }
+    return {
+        "ok": True,
+        "telegram_test": True
+    }
