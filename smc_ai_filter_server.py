@@ -1,10 +1,18 @@
 """
-TradingView Webhook Relay
-=========================
-TradingView -> Render -> Telegram
+TradingView Webhook Relay — MULTI-CANAUX
+========================================
+TradingView -> Render -> Telegram (plusieurs canaux)
 
 Le serveur ne prend aucune décision de trading.
 TradingView est responsable des filtres et décisions.
+
+NOUVEAU : envoie le même message à PLUSIEURS canaux Telegram.
+Configure la variable d'environnement TELEGRAM_CHAT_IDS sur Render :
+   TELEGRAM_CHAT_IDS = -1001111111111,-1002222222222,-1003333333333
+(plusieurs chat_id séparés par des virgules)
+
+Rétro-compatible : si TELEGRAM_CHAT_IDS est vide, on retombe sur
+l'ancienne variable TELEGRAM_CHAT_ID (un seul canal).
 """
 
 import os
@@ -68,6 +76,18 @@ def normalize_direction(value):
     return direction
 
 
+def parse_chat_ids(raw):
+    """Transforme '-100111, -100222' en ['-100111', '-100222']."""
+    if not raw:
+        return []
+    ids = []
+    for part in raw.replace(";", ",").split(","):
+        cid = clean(part)
+        if cid:
+            ids.append(cid)
+    return ids
+
+
 # ============================================================
 # VARIABLES D'ENVIRONNEMENT
 # ============================================================
@@ -80,9 +100,17 @@ TELEGRAM_BOT_TOKEN = clean(
     os.environ.get("TELEGRAM_BOT_TOKEN")
 )
 
-TELEGRAM_CHAT_ID = clean(
+# NOUVEAU : liste de canaux (séparés par des virgules)
+TELEGRAM_CHAT_IDS = parse_chat_ids(
+    os.environ.get("TELEGRAM_CHAT_IDS")
+)
+
+# Rétro-compat : ancien canal unique en secours
+_LEGACY_CHAT_ID = clean(
     os.environ.get("TELEGRAM_CHAT_ID")
 )
+if not TELEGRAM_CHAT_IDS and _LEGACY_CHAT_ID:
+    TELEGRAM_CHAT_IDS = [_LEGACY_CHAT_ID]
 
 
 # ============================================================
@@ -126,20 +154,9 @@ def build_telegram_message(payload):
         "stop"
     )
 
-    tp1 = get_value(
-        payload,
-        "tp1"
-    )
-
-    tp2 = get_value(
-        payload,
-        "tp2"
-    )
-
-    tp3 = get_value(
-        payload,
-        "tp3"
-    )
+    tp1 = get_value(payload, "tp1")
+    tp2 = get_value(payload, "tp2")
+    tp3 = get_value(payload, "tp3")
 
     risk_pct = get_value(
         payload,
@@ -181,90 +198,92 @@ def build_telegram_message(payload):
 
 
 # ============================================================
-# TELEGRAM
+# TELEGRAM (envoi vers UN canal)
 # ============================================================
 
-async def send_telegram(text):
-
-    if not TELEGRAM_BOT_TOKEN:
-        log.error("TELEGRAM_BOT_TOKEN manquant")
-
-        raise HTTPException(
-            status_code=500,
-            detail="TELEGRAM_BOT_TOKEN manquant"
-        )
-
-    if not TELEGRAM_CHAT_ID:
-        log.error("TELEGRAM_CHAT_ID manquant")
-
-        raise HTTPException(
-            status_code=500,
-            detail="TELEGRAM_CHAT_ID manquant"
-        )
-
+async def send_to_chat(client, chat_id, text):
+    """Envoie le message à un seul canal. Retourne (ok, detail)."""
     url = (
         "https://api.telegram.org/"
         f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     )
 
     telegram_payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": chat_id,
         "text": text,
         "disable_web_page_preview": True
     }
 
     try:
-
-        async with httpx.AsyncClient(
-            timeout=15
-        ) as client:
-
-            response = await client.post(
-                url,
-                json=telegram_payload
-            )
+        response = await client.post(url, json=telegram_payload)
 
         log.info(
-            "Telegram HTTP %s",
-            response.status_code
-        )
-
-        log.info(
-            "Telegram réponse: %s",
+            "Telegram %s -> HTTP %s | %s",
+            chat_id,
+            response.status_code,
             response.text
         )
 
         if response.status_code != 200:
-
-            raise HTTPException(
-                status_code=502,
-                detail=response.text
-            )
+            return False, response.text
 
         result = response.json()
 
         if not result.get("ok", False):
+            return False, response.text
 
-            raise HTTPException(
-                status_code=502,
-                detail=response.text
-            )
-
-        return result
-
-    except HTTPException:
-        raise
+        return True, "ok"
 
     except Exception as e:
+        log.exception("Erreur connexion Telegram (%s)", chat_id)
+        return False, str(e)
 
-        log.exception(
-            "Erreur connexion Telegram"
+
+# ============================================================
+# TELEGRAM (diffusion MULTI-CANAUX)
+# ============================================================
+
+async def broadcast_telegram(text):
+
+    if not TELEGRAM_BOT_TOKEN:
+        log.error("TELEGRAM_BOT_TOKEN manquant")
+        raise HTTPException(
+            status_code=500,
+            detail="TELEGRAM_BOT_TOKEN manquant"
         )
 
+    if not TELEGRAM_CHAT_IDS:
+        log.error("Aucun chat_id configuré (TELEGRAM_CHAT_IDS)")
+        raise HTTPException(
+            status_code=500,
+            detail="Aucun canal configuré (TELEGRAM_CHAT_IDS)"
+        )
+
+    results = []
+    sent = 0
+    failed = 0
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        for chat_id in TELEGRAM_CHAT_IDS:
+            ok, detail = await send_to_chat(client, chat_id, text)
+            results.append({
+                "chat_id": chat_id,
+                "ok": ok,
+                "detail": detail
+            })
+            if ok:
+                sent += 1
+            else:
+                failed += 1
+
+    # Si AUCUN canal n'a reçu, on remonte une erreur.
+    if sent == 0:
         raise HTTPException(
             status_code=502,
-            detail=f"Erreur connexion Telegram: {str(e)}"
+            detail={"message": "Aucun envoi réussi", "results": results}
         )
+
+    return {"sent": sent, "failed": failed, "results": results}
 
 
 # ============================================================
@@ -272,7 +291,7 @@ async def send_telegram(text):
 # ============================================================
 
 app = FastAPI(
-    title="TradingView Telegram Relay"
+    title="TradingView Telegram Relay (multi-canaux)"
 )
 
 
@@ -282,15 +301,15 @@ app = FastAPI(
 
 @app.get("/")
 async def health():
-
     return {
         "status": "ok",
-        "mode": "relay_only"
+        "mode": "relay_only",
+        "channels": len(TELEGRAM_CHAT_IDS)
     }
 
 
 # ============================================================
-# TEST TELEGRAM
+# TEST TELEGRAM (diffuse à tous les canaux)
 # ============================================================
 
 @app.get("/test-telegram")
@@ -300,17 +319,16 @@ async def test_telegram():
         "🟢 TEST TELEGRAM\n"
         "\n"
         "Le relais Render fonctionne.\n"
-        "\n"
-        "Service: claudeverstradingview\n"
+        f"Canaux configurés: {len(TELEGRAM_CHAT_IDS)}\n"
         "Status: OK"
     )
 
-    result = await send_telegram(message)
+    result = await broadcast_telegram(message)
 
     return {
         "ok": True,
         "telegram_test": True,
-        "telegram_response": result
+        "broadcast": result
     }
 
 
@@ -324,69 +342,50 @@ async def webhook(request: Request):
     raw = await request.body()
 
     try:
-
         payload = json.loads(raw)
-
     except json.JSONDecodeError:
-
         raise HTTPException(
             status_code=400,
             detail="JSON invalide"
         )
 
     if not isinstance(payload, dict):
-
         raise HTTPException(
             status_code=400,
             detail="Le JSON doit être un objet"
         )
 
-    received_secret = str(
-        payload.pop("secret", "")
-    )
+    received_secret = str(payload.pop("secret", ""))
 
     if not WEBHOOK_SECRET:
-
-        log.error(
-            "WEBHOOK_SECRET manquant"
-        )
-
+        log.error("WEBHOOK_SECRET manquant")
         raise HTTPException(
             status_code=500,
             detail="WEBHOOK_SECRET manquant"
         )
 
-    if not hmac.compare_digest(
-        received_secret,
-        WEBHOOK_SECRET
-    ):
-
-        log.warning(
-            "Secret webhook invalide"
-        )
-
+    if not hmac.compare_digest(received_secret, WEBHOOK_SECRET):
+        log.warning("Secret webhook invalide")
         raise HTTPException(
             status_code=401,
             detail="Secret invalide"
         )
 
-    message = build_telegram_message(
-        payload
-    )
+    message = build_telegram_message(payload)
 
-    result = await send_telegram(
-        message
-    )
+    result = await broadcast_telegram(message)
 
     log.info(
-        "Signal envoyé : %s %s | lot=%s",
+        "Signal diffusé : %s %s | lot=%s | %s/%s canaux OK",
         payload.get("dir"),
         payload.get("sym"),
-        payload.get("lot")
+        payload.get("lot"),
+        result["sent"],
+        result["sent"] + result["failed"]
     )
 
     return {
         "ok": True,
         "sent": True,
-        "telegram_response": result
+        "broadcast": result
     }
