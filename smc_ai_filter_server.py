@@ -190,17 +190,17 @@ async def send_telegram(text):
             json=telegram_payload
         )
 
-        if response.status_code != 200:
-            log.error(
-                "Erreur Telegram %s : %s",
-                response.status_code,
-                response.text
-            )
+       if response.status_code != 200:
+    log.error(
+        "Erreur Telegram %s : %s",
+        response.status_code,
+        response.text
+    )
 
-            raise HTTPException(
-                status_code=502,
-                detail="Erreur Telegram"
-            )
+    raise HTTPException(
+        status_code=502,
+        detail=response.text
+    )
 
 
 # ============================================================
