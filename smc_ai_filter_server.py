@@ -16,10 +16,6 @@ import httpx
 from fastapi import FastAPI, Request, HTTPException
 
 
-# ============================================================
-# LOGGING
-# ============================================================
-
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tradingview-relay")
 
@@ -151,6 +147,14 @@ def build_telegram_message(payload):
         "riskPct"
     )
 
+    # Lot envoyé par TradingView
+    lot = get_value(
+        payload,
+        "lot",
+        "lots",
+        "position_size"
+    )
+
     if direction == "BUY":
         icon = "🟢"
     elif direction == "SELL":
@@ -169,7 +173,8 @@ def build_telegram_message(payload):
         f"TP2: {format_number(tp2)}\n"
         f"TP3: {format_number(tp3)}\n"
         f"\n"
-        f"Risk: {format_number(risk_pct)}%"
+        f"Risk: {format_number(risk_pct)}%\n"
+        f"Lot: {format_number(lot)}"
     )
 
     return message
@@ -374,9 +379,10 @@ async def webhook(request: Request):
     )
 
     log.info(
-        "Signal envoyé : %s %s",
+        "Signal envoyé : %s %s | lot=%s",
         payload.get("dir"),
-        payload.get("sym")
+        payload.get("sym"),
+        payload.get("lot")
     )
 
     return {
