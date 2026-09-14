@@ -1,17 +1,22 @@
 """
-TradingView Webhook Relay — MULTI-CANAUX + POSTGRESQL + MT5
-=============================================================
+TradingView Webhook Relay — MULTI-CANAUX + POSTGRESQL + MT5 + FILTRE NEWS
+=========================================================================
 
 TradingView
     -> Render /webhook
         -> PostgreSQL
         -> Telegram
-        -> MT5 via /next-signal
+        -> MT5 via /next-signal   (avec FILTRE NEWS)
 
-Le serveur ne prend aucune décision de trading.
+Le serveur ne prend aucune decision de trading.
 TradingView reste responsable des signaux.
 
-PostgreSQL conserve les signaux même après redémarrage de Render.
+NOUVEAU : filtre news live (calendrier ForexFactory / faireconomy).
+Le serveur telecharge le calendrier ~1x/heure et REFUSE de servir un signal
+si une annonce a fort impact est dans la fenetre configuree (avant/apres).
+Le robot MT5 n'a PAS besoin d'etre modifie.
+
+PostgreSQL conserve les signaux meme apres redemarrage de Render.
 """
 
 import os
@@ -135,7 +140,7 @@ DATABASE_URL = clean(
 
 
 # ------------------------------------------------------------
-# Clé API réservée à MT5
+# Cle API reservee a MT5
 # ------------------------------------------------------------
 
 MT5_API_KEY = clean(
@@ -143,8 +148,52 @@ MT5_API_KEY = clean(
 )
 
 
+# ------------------------------------------------------------
+# FILTRE NEWS (calendrier economique live)
+# ------------------------------------------------------------
+
+def _list_env(name, default):
+    raw = clean(os.environ.get(name)) or default
+    return [x.strip().upper() for x in raw.replace(";", ",").split(",") if x.strip()]
+
+
+def _int_env(name, default):
+    try:
+        return int(clean(os.environ.get(name)) or default)
+    except ValueError:
+        return default
+
+
+# Active/desactive le filtre (mets NEWS_FILTER_ENABLED=0 pour couper)
+NEWS_FILTER_ENABLED = clean(
+    os.environ.get("NEWS_FILTER_ENABLED", "1")
+) not in ("0", "false", "False", "")
+
+# Source du calendrier (ForexFactory via faireconomy, gratuit, sans cle)
+NEWS_CALENDAR_URL = clean(
+    os.environ.get("NEWS_CALENDAR_URL")
+) or "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+
+# Niveaux d'impact qui bloquent (par defaut : High seulement)
+NEWS_IMPACTS = _list_env("NEWS_IMPACTS", "High")
+
+# Devises concernees (l'or = USD ; ajoute EUR,GBP... si tu veux)
+NEWS_CURRENCIES = _list_env("NEWS_CURRENCIES", "USD")
+
+# Fenetre de blocage autour de l'annonce (minutes)
+NEWS_BEFORE_MIN = _int_env("NEWS_BEFORE_MIN", 30)
+NEWS_AFTER_MIN = _int_env("NEWS_AFTER_MIN", 30)
+
+# Rafraichissement du calendrier (minutes). >= 30 conseille (limite ForexFactory)
+NEWS_REFRESH_MIN = _int_env("NEWS_REFRESH_MIN", 60)
+
+# Cache en memoire
+_news_events = []        # [{title, country, impact, dt(UTC)}]
+_news_fetched_at = None  # datetime UTC du dernier chargement reussi
+
+
 # ============================================================
-# BASE DE DONNÉES
+# BASE DE DONNEES
 # ============================================================
 
 def get_db():
@@ -225,7 +274,7 @@ def init_db():
 
         conn.commit()
 
-        log.info("PostgreSQL initialisée.")
+        log.info("PostgreSQL initialisee.")
 
     finally:
 
@@ -253,19 +302,122 @@ def check_mt5_api(request: Request):
     if not received_key:
         raise HTTPException(
             status_code=401,
-            detail="Clé MT5 manquante"
+            detail="Cle MT5 manquante"
         )
 
     if not hmac.compare_digest(
         received_key,
         MT5_API_KEY
     ):
-        log.warning("Tentative MT5 avec clé invalide")
+        log.warning("Tentative MT5 avec cle invalide")
 
         raise HTTPException(
             status_code=401,
-            detail="Clé MT5 invalide"
+            detail="Cle MT5 invalide"
         )
+
+
+# ============================================================
+# FILTRE NEWS — calendrier live (ForexFactory / faireconomy)
+# ============================================================
+
+async def refresh_news_calendar():
+    """Telecharge et met en cache les evenements filtres. Ne casse jamais le service."""
+    global _news_events, _news_fetched_at
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.get(
+                NEWS_CALENDAR_URL,
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+
+        text = r.text.strip()
+
+        # Si limite depassee, ForexFactory renvoie du HTML "Request Denied"
+        if r.status_code != 200 or not text.startswith("["):
+            log.warning(
+                "News: reponse inattendue (HTTP %s) - on garde le cache",
+                r.status_code
+            )
+            return
+
+        raw = json.loads(text)
+
+    except Exception:
+        log.exception("News: echec de recuperation du calendrier")
+        return
+
+    events = []
+
+    for e in raw:
+        try:
+            impact = str(e.get("impact", "")).upper()
+            country = str(e.get("country", "")).upper()
+
+            if impact not in NEWS_IMPACTS:
+                continue
+            if country not in NEWS_CURRENCIES:
+                continue
+
+            dt = datetime.fromisoformat(str(e.get("date")))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+
+            events.append({
+                "title": str(e.get("title", "")),
+                "country": country,
+                "impact": impact,
+                "dt": dt.astimezone(timezone.utc),
+            })
+        except Exception:
+            continue
+
+    _news_events = events
+    _news_fetched_at = datetime.now(timezone.utc)
+
+    log.info(
+        "News: %d evenements charges (devises=%s impacts=%s)",
+        len(events), NEWS_CURRENCIES, NEWS_IMPACTS
+    )
+
+
+async def maybe_refresh_news():
+    """Rafraichit le calendrier seulement s'il est perime (respecte la limite FF)."""
+    if not NEWS_FILTER_ENABLED:
+        return
+
+    if _news_fetched_at is None:
+        await refresh_news_calendar()
+        return
+
+    age = (datetime.now(timezone.utc) - _news_fetched_at).total_seconds()
+    if age >= NEWS_REFRESH_MIN * 60:
+        await refresh_news_calendar()
+
+
+def news_blackout(now):
+    """Retourne (bloque: bool, raison: str) si 'now' est dans une fenetre news."""
+    if not NEWS_FILTER_ENABLED:
+        return (False, "")
+
+    before = timedelta(minutes=NEWS_BEFORE_MIN)
+    after = timedelta(minutes=NEWS_AFTER_MIN)
+
+    for e in _news_events:
+        start = e["dt"] - before
+        end = e["dt"] + after
+        if start <= now <= end:
+            return (
+                True,
+                "%s (%s) a %s" % (
+                    e["title"],
+                    e["country"],
+                    e["dt"].strftime("%Y-%m-%d %H:%M UTC"),
+                ),
+            )
+
+    return (False, "")
 
 
 # ============================================================
@@ -418,7 +570,7 @@ async def broadcast_telegram(text):
 
         raise HTTPException(
             status_code=500,
-            detail="Aucun canal Telegram configuré"
+            detail="Aucun canal Telegram configure"
         )
 
     results = []
@@ -453,7 +605,7 @@ async def broadcast_telegram(text):
         raise HTTPException(
             status_code=502,
             detail={
-                "message": "Aucun envoi Telegram réussi",
+                "message": "Aucun envoi Telegram reussi",
                 "results": results
             }
         )
@@ -470,7 +622,7 @@ async def broadcast_telegram(text):
 # ============================================================
 
 app = FastAPI(
-    title="TradingView Telegram Relay + MT5"
+    title="TradingView Telegram Relay + MT5 + News"
 )
 
 
@@ -482,14 +634,14 @@ app = FastAPI(
 async def startup():
 
     try:
-
         init_db()
-
     except Exception:
+        log.exception("Impossible d'initialiser PostgreSQL")
 
-        log.exception(
-            "Impossible d'initialiser PostgreSQL"
-        )
+    try:
+        await refresh_news_calendar()
+    except Exception:
+        log.exception("Impossible de charger le calendrier news")
 
 
 # ============================================================
@@ -506,7 +658,9 @@ async def health():
             TELEGRAM_CHAT_IDS
         ),
         "database": bool(DATABASE_URL),
-        "mt5_api": bool(MT5_API_KEY)
+        "mt5_api": bool(MT5_API_KEY),
+        "news_filter": NEWS_FILTER_ENABLED,
+        "news_events_loaded": len(_news_events),
     }
 
 
@@ -521,7 +675,7 @@ async def test_telegram():
         "🟢 TEST TELEGRAM\n"
         "\n"
         "Le relais Render fonctionne.\n"
-        f"Canaux configurés: {len(TELEGRAM_CHAT_IDS)}\n"
+        f"Canaux configures: {len(TELEGRAM_CHAT_IDS)}\n"
         "PostgreSQL: active\n"
         "MT5 API: active\n"
         "Status: OK"
@@ -535,6 +689,49 @@ async def test_telegram():
         "ok": True,
         "telegram_test": True,
         "broadcast": result
+    }
+
+
+# ============================================================
+# ETAT DU FILTRE NEWS (debug / verification)
+# ============================================================
+
+@app.get("/news")
+async def news(request: Request):
+
+    check_mt5_api(request)
+
+    await maybe_refresh_news()
+
+    now = datetime.now(timezone.utc)
+    blocked, reason = news_blackout(now)
+
+    upcoming = [
+        {
+            "title": e["title"],
+            "country": e["country"],
+            "impact": e["impact"],
+            "when_utc": e["dt"].strftime("%Y-%m-%d %H:%M"),
+        }
+        for e in sorted(_news_events, key=lambda x: x["dt"])
+        if e["dt"] >= now - timedelta(minutes=NEWS_AFTER_MIN)
+    ][:20]
+
+    return {
+        "ok": True,
+        "enabled": NEWS_FILTER_ENABLED,
+        "blocked_now": blocked,
+        "reason": reason,
+        "window_before_min": NEWS_BEFORE_MIN,
+        "window_after_min": NEWS_AFTER_MIN,
+        "currencies": NEWS_CURRENCIES,
+        "impacts": NEWS_IMPACTS,
+        "events_loaded": len(_news_events),
+        "last_fetch_utc": (
+            _news_fetched_at.strftime("%Y-%m-%d %H:%M")
+            if _news_fetched_at else None
+        ),
+        "upcoming": upcoming,
     }
 
 
@@ -562,11 +759,11 @@ async def webhook(request: Request):
 
         raise HTTPException(
             status_code=400,
-            detail="Le JSON doit être un objet"
+            detail="Le JSON doit etre un objet"
         )
 
     # --------------------------------------------------------
-    # Vérification secret TradingView
+    # Verification secret TradingView
     # --------------------------------------------------------
 
     received_secret = str(
@@ -764,7 +961,7 @@ async def webhook(request: Request):
         conn.close()
 
     log.info(
-        "Signal enregistré : %s | %s %s",
+        "Signal enregistre : %s | %s %s",
         signal_id,
         direction,
         symbol
@@ -783,7 +980,7 @@ async def webhook(request: Request):
     )
 
     # --------------------------------------------------------
-    # RÉPONSE
+    # REPONSE
     # --------------------------------------------------------
 
     return {
@@ -801,7 +998,7 @@ async def webhook(request: Request):
 
 
 # ============================================================
-# MT5 : PROCHAIN SIGNAL
+# MT5 : PROCHAIN SIGNAL   (avec FILTRE NEWS)
 # ============================================================
 
 @app.get("/next-signal")
@@ -810,6 +1007,9 @@ async def next_signal(
 ):
 
     check_mt5_api(request)
+
+    # Rafraichit le calendrier si perime (au plus ~1x/heure)
+    await maybe_refresh_news()
 
     conn = get_db()
 
@@ -860,6 +1060,49 @@ async def next_signal(
                 }
 
             # ------------------------------------------------
+            # FILTRE NEWS : ne pas trader autour d'une annonce
+            # ------------------------------------------------
+
+            blocked, reason = news_blackout(
+                datetime.now(timezone.utc)
+            )
+
+            if blocked:
+
+                cur.execute(
+                    """
+                    UPDATE signals
+
+                    SET
+                        status = 'REJECTED',
+                        rejected_at = NOW(),
+                        error_message = %s
+
+                    WHERE signal_id = %s
+                    """,
+
+                    (
+                        ("news: " + reason)[:500],
+                        signal["signal_id"],
+                    )
+                )
+
+                conn.commit()
+
+                log.info(
+                    "News blackout -> signal %s rejete (%s)",
+                    signal["signal_id"],
+                    reason
+                )
+
+                return {
+                    "ok": True,
+                    "signal": None,
+                    "news_blocked": True,
+                    "reason": reason
+                }
+
+            # ------------------------------------------------
             # CLAIM
             # ------------------------------------------------
 
@@ -892,7 +1135,7 @@ async def next_signal(
 
 
 # ============================================================
-# MT5 : SIGNAL EXÉCUTÉ
+# MT5 : SIGNAL EXECUTE
 # ============================================================
 
 @app.post("/signal-executed")
@@ -962,11 +1205,11 @@ async def signal_executed(
 
         raise HTTPException(
             status_code=409,
-            detail="Signal introuvable ou déjà traité"
+            detail="Signal introuvable ou deja traite"
         )
 
     log.info(
-        "Signal exécuté : %s",
+        "Signal execute : %s",
         signal_id
     )
 
@@ -978,7 +1221,7 @@ async def signal_executed(
 
 
 # ============================================================
-# MT5 : SIGNAL REJETÉ
+# MT5 : SIGNAL REJETE
 # ============================================================
 
 @app.post("/signal-rejected")
@@ -1054,7 +1297,7 @@ async def signal_rejected(
 
         raise HTTPException(
             status_code=409,
-            detail="Signal introuvable ou déjà traité"
+            detail="Signal introuvable ou deja traite"
         )
 
     return {
