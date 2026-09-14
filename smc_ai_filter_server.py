@@ -1011,6 +1011,10 @@ async def next_signal(
     # Rafraichit le calendrier si perime (au plus ~1x/heure)
     await maybe_refresh_news()
 
+    # Symbole demande par l'EA (ex: /next-signal?symbol=GOLD)
+    # Chaque robot ne recoit QUE les signaux de son symbole.
+    want_symbol = clean(request.query_params.get("symbol"))
+
     conn = get_db()
 
     try:
@@ -1020,33 +1024,64 @@ async def next_signal(
         ) as cur:
 
             # ------------------------------------------------
-            # Signal NEW
-            # OU signal CLAIMED depuis plus de 5 minutes
+            # Signal NEW (ou CLAIMED depuis > 5 min),
+            # filtre par symbole si l'EA en precise un.
             # ------------------------------------------------
 
-            cur.execute(
-                """
-                SELECT *
-                FROM signals
+            if want_symbol:
 
-                WHERE
-                    status = 'NEW'
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM signals
 
-                    OR
+                    WHERE
+                        (
+                            status = 'NEW'
+                            OR
+                            (
+                                status = 'CLAIMED'
+                                AND claimed_at <
+                                    NOW() - INTERVAL '5 minutes'
+                            )
+                        )
 
-                    (
-                        status = 'CLAIMED'
-                        AND claimed_at <
-                            NOW() - INTERVAL '5 minutes'
-                    )
+                        AND UPPER(symbol) = UPPER(%s)
 
-                ORDER BY created_at ASC
+                    ORDER BY created_at ASC
 
-                LIMIT 1
+                    LIMIT 1
 
-                FOR UPDATE SKIP LOCKED
-                """
-            )
+                    FOR UPDATE SKIP LOCKED
+                    """,
+                    (want_symbol,)
+                )
+
+            else:
+
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM signals
+
+                    WHERE
+                        status = 'NEW'
+
+                        OR
+
+                        (
+                            status = 'CLAIMED'
+                            AND claimed_at <
+                                NOW() - INTERVAL '5 minutes'
+                        )
+
+                    ORDER BY created_at ASC
+
+                    LIMIT 1
+
+                    FOR UPDATE SKIP LOCKED
+                    """
+                )
 
             signal = cur.fetchone()
 
