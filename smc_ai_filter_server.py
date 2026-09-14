@@ -187,9 +187,14 @@ NEWS_AFTER_MIN = _int_env("NEWS_AFTER_MIN", 30)
 # Rafraichissement du calendrier (minutes). >= 30 conseille (limite ForexFactory)
 NEWS_REFRESH_MIN = _int_env("NEWS_REFRESH_MIN", 60)
 
+# En cas d'echec, delai minimum avant de reessayer (minutes) -> evite de
+# marteler ForexFactory (limite 2 telechargements / 5 min)
+NEWS_RETRY_MIN = _int_env("NEWS_RETRY_MIN", 5)
+
 # Cache en memoire
 _news_events = []        # [{title, country, impact, dt(UTC)}]
-_news_fetched_at = None  # datetime UTC du dernier chargement reussi
+_news_fetched_at = None  # datetime UTC du dernier chargement REUSSI
+_news_last_attempt = None  # datetime UTC de la derniere TENTATIVE (reussie ou non)
 
 
 # ============================================================
@@ -383,17 +388,28 @@ async def refresh_news_calendar():
 
 
 async def maybe_refresh_news():
-    """Rafraichit le calendrier seulement s'il est perime (respecte la limite FF)."""
+    """Rafraichit le calendrier si perime, avec back-off en cas d'echec
+    (respecte la limite ForexFactory : 2 telechargements / 5 min)."""
+    global _news_last_attempt
+
     if not NEWS_FILTER_ENABLED:
         return
 
-    if _news_fetched_at is None:
-        await refresh_news_calendar()
-        return
+    now = datetime.now(timezone.utc)
 
-    age = (datetime.now(timezone.utc) - _news_fetched_at).total_seconds()
-    if age >= NEWS_REFRESH_MIN * 60:
-        await refresh_news_calendar()
+    # Cache encore frais -> rien a faire
+    if _news_fetched_at is not None:
+        if (now - _news_fetched_at).total_seconds() < NEWS_REFRESH_MIN * 60:
+            return
+
+    # Back-off : ne pas reessayer plus d'une fois par NEWS_RETRY_MIN,
+    # meme si le dernier essai a echoue (evite de marteler ForexFactory)
+    if _news_last_attempt is not None:
+        if (now - _news_last_attempt).total_seconds() < NEWS_RETRY_MIN * 60:
+            return
+
+    _news_last_attempt = now
+    await refresh_news_calendar()
 
 
 def news_blackout(now):
